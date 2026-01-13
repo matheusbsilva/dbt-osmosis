@@ -8,6 +8,7 @@ import re
 import typing as t
 from dataclasses import dataclass
 from textwrap import dedent
+from typing import Protocol
 
 import openai
 from openai import OpenAI
@@ -31,6 +32,171 @@ __all__ = [
     "suggest_documentation_improvements",
     "DocumentationSuggestion",
 ]
+
+
+@dataclass
+class LLMResponse:
+    content: str
+    raw_response: t.Any
+    model: str
+    provider: str
+
+
+@dataclass
+class ProviderConfig:
+    provider: str
+    client: t.Any
+    model: str
+
+
+class LLMBackend(Protocol):
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+    ) -> LLMResponse: ...
+
+    def is_available(self) -> bool: ...
+
+    @property
+    def name(self) -> str: ...
+
+
+class APIBackend:
+    def __init__(self, config: ProviderConfig | None = None) -> None:
+        self._config = config
+
+    def _ensure_config(self) -> ProviderConfig:
+        if self._config is not None:
+            return self._config
+
+        provider = os.getenv("LLM_PROVIDER", "openai").lower()
+
+        if provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise LLMConfigurationError("OPENAI_API_KEY not set for OpenAI provider")
+            client = OpenAI(api_key=api_key)
+            model = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+        elif provider == "azure-openai":
+            openai.api_type = "azure-openai"
+            openai.api_base = os.getenv("AZURE_OPENAI_BASE_URL")
+            openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+            openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
+            model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+            if not (openai.api_base and openai.api_key and model):
+                raise LLMConfigurationError(
+                    "Azure environment variables (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+                    "AZURE_OPENAI_DEPLOYMENT_NAME) not properly set for azure-openai provider"
+                )
+            client = openai
+
+        elif provider == "lm-studio":
+            client = OpenAI(
+                base_url=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
+                api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
+            )
+            model = os.getenv("LM_STUDIO_MODEL", "local-model")
+
+        elif provider == "ollama":
+            client = OpenAI(
+                base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+                api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+            )
+            model = os.getenv("OLLAMA_MODEL", "llama2:latest")
+
+        elif provider == "google-gemini":
+            api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
+            if not api_key:
+                raise LLMConfigurationError(
+                    "GOOGLE_GEMINI_API_KEY not set for google-gemini provider"
+                )
+            client = OpenAI(
+                base_url=os.getenv(
+                    "GOOGLE_GEMINI_BASE_URL",
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                ),
+                api_key=api_key,
+            )
+            model = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
+
+        elif provider == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise LLMConfigurationError("ANTHROPIC_API_KEY not set for anthropic provider")
+            client = OpenAI(
+                base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+                api_key=api_key,
+            )
+            model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
+
+        else:
+            raise LLMConfigurationError(
+                f"Invalid LLM provider '{provider}'. Valid options: openai, azure-openai, "
+                "google-gemini, anthropic, lm-studio, ollama."
+            )
+
+        self._config = ProviderConfig(provider=provider, client=client, model=model)
+        return self._config
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+    ) -> LLMResponse:
+        config = self._ensure_config()
+
+        # Azure uses legacy SDK structure
+        if config.provider == "azure-openai":
+            response = config.client.ChatCompletion.create(
+                engine=config.model,
+                messages=messages,
+                temperature=temperature,
+            )
+        else:
+            response = config.client.chat.completions.create(
+                model=config.model,
+                messages=messages,
+                temperature=temperature,
+            )
+
+        content = response.choices[0].message.content
+        return LLMResponse(
+            content=content or "",
+            raw_response=response,
+            model=config.model,
+            provider=config.provider,
+        )
+
+    def is_available(self) -> bool:
+        try:
+            self._ensure_config()
+            return True
+        except LLMConfigurationError:
+            return False
+
+    @property
+    def name(self) -> str:
+        if self._config:
+            return self._config.provider
+        return os.getenv("LLM_PROVIDER", "openai").lower()
+
+
+def _call_llm(
+    messages: list[dict[str, str]],
+    temperature: float = 0.7,
+    backend: LLMBackend | None = None,
+) -> str:
+    if backend is None:
+        backend = APIBackend()
+
+    response = backend.generate(messages, temperature)
+
+    if not response.content:
+        raise LLMResponseError("LLM returned an empty response")
+
+    return response.content.strip()
 
 
 def _redact_credentials(text: str) -> str:
@@ -63,108 +229,11 @@ def _redact_credentials(text: str) -> str:
     return redacted
 
 
-# Dynamic client creation function
-def get_llm_client():
-    """Creates and returns an LLM client and model engine string based on environment variables.
-
-    Returns:
-        tuple: (client, model_engine) where client is an OpenAI or openai object, and model_engine is the model name.
-
-    Raises:
-        LLMConfigurationError: If required environment variables are missing or provider is invalid.
-
-    """
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-
-    if provider == "openai":
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise LLMConfigurationError("OPENAI_API_KEY not set for OpenAI provider")
-        client = OpenAI(api_key=openai_api_key)
-        model_engine = os.getenv("OPENAI_MODEL", "gpt-4o")
-
-    elif provider == "azure-openai":
-        openai.api_type = "azure-openai"
-        openai.api_base = os.getenv("AZURE_OPENAI_BASE_URL")
-        openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-        openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        model_engine = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-
-        if not (openai.api_base and openai.api_key and model_engine):
-            raise LLMConfigurationError(
-                "Azure environment variables (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT_NAME) not properly set for azure-openai provider",
-            )
-        # For Azure, the global openai object is used directly (legacy SDK structure preferred)
-        return openai, model_engine
-
-    elif provider == "lm-studio":
-        client = OpenAI(
-            base_url=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
-            api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
-        )
-        model_engine = os.getenv("LM_STUDIO_MODEL", "local-model")
-
-    elif provider == "ollama":
-        client = OpenAI(
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-            api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
-        )
-        model_engine = os.getenv("OLLAMA_MODEL", "llama2:latest")
-
-    elif provider == "google-gemini":
-        client = OpenAI(
-            base_url=os.getenv(
-                "GOOGLE_GEMINI_BASE_URL",
-                "https://generativelanguage.googleapis.com/v1beta/openai",
-            ),
-            api_key=os.getenv("GOOGLE_GEMINI_API_KEY"),
-        )
-        model_engine = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
-
-        if not client.api_key:
-            raise LLMConfigurationError(
-                "GEMINI environment variables GOOGLE_GEMINI_API_KEY not set for google-gemini provider",
-            )
-
-    elif provider == "anthropic":
-        client = OpenAI(
-            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-        )
-        model_engine = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
-
-        if not client.api_key:
-            raise LLMConfigurationError(
-                "Anthropic environment variables ANTHROPIC_API_KEY not set for anthropic provider",
-            )
-
-    else:
-        raise LLMConfigurationError(
-            f"Invalid LLM provider '{provider}'. Valid options: openai, azure-openai, google-gemini, anthropic, lm-studio, ollama.",
-        )
-
-    # Define required environment variables for each provider
-    required_env_vars = {
-        "openai": ["OPENAI_API_KEY"],
-        "azure-openai": [
-            "AZURE_OPENAI_BASE_URL",
-            "AZURE_OPENAI_API_KEY",
-            "AZURE_OPENAI_DEPLOYMENT_NAME",
-        ],
-        "lm-studio": ["LM_STUDIO_BASE_URL", "LM_STUDIO_API_KEY"],
-        "ollama": ["OLLAMA_BASE_URL", "OLLAMA_API_KEY"],
-        "google-gemini": ["GOOGLE_GEMINI_API_KEY"],
-        "anthropic": ["ANTHROPIC_API_KEY"],
-    }
-
-    # Check for missing environment variables
-    missing_vars = [var for var in required_env_vars[provider] if not os.getenv(var)]
-    if missing_vars:
-        raise LLMConfigurationError(
-            f"ERROR: Missing environment variables for {provider}: {', '.join(missing_vars)}. Please refer to the documentation to set them correctly.",
-        )
-
-    return client, model_engine
+def get_llm_client() -> tuple[t.Any, str]:
+    """Backwards compatibility wrapper for getting LLM client and model."""
+    backend = APIBackend()
+    config = backend._ensure_config()
+    return config.client, config.model
 
 
 def _create_llm_prompt_for_model_docs_as_json(
@@ -176,6 +245,7 @@ def _create_llm_prompt_for_model_docs_as_json(
     if upstream_docs is None:
         upstream_docs = []
 
+    # TODO: Move this from here
     example_json = dedent(
         """\
     {
@@ -194,6 +264,7 @@ def _create_llm_prompt_for_model_docs_as_json(
     """,
     )
 
+    # TODO: Important prompt, defines how the model should generate the documentation
     system_prompt = dedent(
         f"""
     You are a helpful SQL Developer and an Expert in dbt.
@@ -396,6 +467,8 @@ def generate_model_spec_as_json(
 
     client, model_engine = get_llm_client()
 
+    # TODO: Create an API to abstract the call to the llm api so we
+    # dont have situations like this, where he have
     if os.getenv("LLM_PROVIDER", "openai").lower() == "azure-openai":
         # Legacy structure for Azure OpenAI Service
         response = client.ChatCompletion.create(
