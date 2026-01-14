@@ -452,8 +452,8 @@ def generate_model_spec_as_json(
     Args:
         sql_content (str): Full SQL code of the model
         upstream_docs (list[str] | None): Optional list of strings containing context or upstream docs
-        model_engine (str): Which OpenAI model to use (e.g., 'gpt-3.5-turbo', 'gpt-4')
-        temperature (float): OpenAI completion temperature
+        existing_context (str | None): Optional existing context about the model
+        temperature (float): LLM completion temperature
 
     Returns:
         dict[str, t.Any]: A dictionary with keys "description", "columns".
@@ -465,30 +465,8 @@ def generate_model_spec_as_json(
         upstream_docs,
     )
 
-    client, model_engine = get_llm_client()
+    content = _call_llm(messages, temperature)
 
-    # TODO: Create an API to abstract the call to the llm api so we
-    # dont have situations like this, where he have
-    if os.getenv("LLM_PROVIDER", "openai").lower() == "azure-openai":
-        # Legacy structure for Azure OpenAI Service
-        response = client.ChatCompletion.create(
-            engine=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-    else:
-        # New SDK structure for OpenAI default, LM Studio, Ollama
-        response = client.chat.completions.create(
-            model=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-
-    content = response.choices[0].message.content
-    if content is None:
-        raise LLMResponseError("LLM returned an empty response")
-
-    content = content.strip()
     if content.startswith("```") and content.endswith("```"):
         content = content[content.find("{") : content.rfind("}") + 1]
     try:
@@ -513,8 +491,7 @@ def generate_column_doc(
         existing_context (str | None): Any relevant metadata or table definitions
         table_name (str | None): Name of the table/model (optional)
         upstream_docs (list[str] | None): Optional docs or references you might have
-        model_engine (str): The OpenAI model to use (e.g., 'gpt-3.5-turbo')
-        temperature (float): OpenAI completion temperature
+        temperature (float): LLM completion temperature
 
     Returns:
         str: A short docstring suitable for a "description" field
@@ -526,28 +503,7 @@ def generate_column_doc(
         table_name,
         upstream_docs,
     )
-
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    return content.strip()
+    return _call_llm(messages, temperature)
 
 
 def generate_table_doc(
@@ -556,42 +512,20 @@ def generate_table_doc(
     upstream_docs: list[str] | None = None,
     temperature: float = 0.7,
 ) -> str:
-    """Calls the LLM client to generate documentation for a single column in a table.
+    """Calls the LLM client to generate documentation for a table.
 
     Args:
         sql_content (str): The SQL code for the table
-        table_name (str | None): Name of the table/model (optional)
+        table_name (str): Name of the table/model
         upstream_docs (list[str] | None): Optional docs or references you might have
-        model_engine (str): The OpenAI model to use (e.g., 'gpt-3.5-turbo')
-        temperature (float): OpenAI completion temperature
+        temperature (float): LLM completion temperature
 
     Returns:
         str: A short docstring suitable for a "description" field
 
     """
     messages = _create_llm_prompt_for_table(sql_content, table_name, upstream_docs)
-
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine,
-            messages=messages,
-            temperature=temperature,
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    return content.strip()
+    return _call_llm(messages, temperature)
 
 
 def _create_llm_prompt_for_semantic_analysis(
@@ -750,24 +684,8 @@ def analyze_column_semantics(
         upstream_columns=upstream_columns,
     )
 
-    client, model_engine = get_llm_client()
+    content = _call_llm(messages, temperature)
 
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    content = content.strip()
-    # Remove markdown fences if present
     if content.startswith("```") and content.endswith("```"):
         content = content[content.find("{") : content.rfind("}") + 1]
 
@@ -859,24 +777,7 @@ def generate_semantic_description(
         {"role": "system", "content": system_prompt.strip()},
         {"role": "user", "content": user_message.strip()},
     ]
-
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    return content.strip()
+    return _call_llm(messages, temperature)
 
 
 def _create_llm_prompt_for_nl_to_sql(
@@ -1051,26 +952,9 @@ def generate_sql_from_nl(
     """
     messages = _create_llm_prompt_for_nl_to_sql(query, available_sources, schema_context)
 
-    client, model_engine = get_llm_client()
+    content = _call_llm(messages, temperature)
 
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    # Clean up markdown fences if present
-    content = content.strip()
     if content.startswith("```"):
-        # Extract SQL from markdown code blocks
         lines = content.split("\n")
         sql_lines = []
         in_sql = False
@@ -1121,24 +1005,9 @@ def generate_dbt_model_from_nl(
     """
     messages = _create_llm_prompt_for_nl_to_dbt_model(query, available_sources, schema_context)
 
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if content is None:
-        raise LLMResponseError("LLM returned an empty response")
+    content = _call_llm(messages, temperature)
 
     # Clean up markdown fences if present
-    content = content.strip()
     if content.startswith("```"):
         content = content[content.find("{") : content.rfind("}") + 1]
 
@@ -1406,25 +1275,10 @@ def generate_staging_model_spec(
         source_type=source_type,
     )
 
-    client, model_engine = get_llm_client()
+    content = _call_llm(messages, temperature)
 
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    content = content.strip()
+    # Extract JSON from markdown code block if present
     if content.startswith("```"):
-        # Extract JSON from markdown code block
         content = content[content.find("{") : content.rfind("}") + 1]
 
     try:
@@ -1733,7 +1587,7 @@ def generate_style_aware_column_doc(
         existing_context: Any relevant metadata or table definitions
         table_name: Name of the table/model (optional)
         upstream_docs: Optional docs or references
-        temperature: OpenAI completion temperature
+        temperature: LLM completion temperature
         style_profile: Project style profile for voice learning
         style_examples: Specific style examples to follow
         current_description: Current description to improve upon
@@ -1750,24 +1604,7 @@ def generate_style_aware_column_doc(
         style_examples=style_examples,
         current_description=current_description,
     )
-
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    return content.strip()
+    return _call_llm(messages, temperature)
 
 
 def generate_style_aware_table_doc(
@@ -1785,7 +1622,7 @@ def generate_style_aware_table_doc(
         sql_content: The SQL code for the table
         table_name: Name of the table/model
         upstream_docs: Optional docs or references
-        temperature: OpenAI completion temperature
+        temperature: LLM completion temperature
         style_profile: Project style profile for voice learning
         style_examples: Specific style examples to follow
         current_description: Current description to improve upon
@@ -1801,24 +1638,7 @@ def generate_style_aware_table_doc(
         style_examples=style_examples,
         current_description=current_description,
     )
-
-    client, model_engine = get_llm_client()
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "azure-openai":
-        response = client.ChatCompletion.create(
-            engine=model_engine, messages=messages, temperature=temperature
-        )
-    else:
-        response = client.chat.completions.create(
-            model=model_engine, messages=messages, temperature=temperature
-        )
-
-    content = response.choices[0].message.content
-    if not content:
-        raise LLMResponseError("LLM returned an empty response")
-
-    return content.strip()
+    return _call_llm(messages, temperature)
 
 
 def suggest_documentation_improvements(
