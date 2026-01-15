@@ -183,6 +183,173 @@ class APIBackend:
         return os.getenv("LLM_PROVIDER", "openai").lower()
 
 
+def _messages_to_prompt(messages: list[dict[str, str]]) -> str:
+    """Convert chat messages to a single prompt string for CLI-based backends.
+
+    Flattens system and user messages into a structured prompt that preserves
+    the intent of the original chat format.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+
+    Returns:
+        A single string prompt suitable for CLI tools.
+    """
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            parts.append(f"<system>\n{content}\n</system>")
+        elif role == "assistant":
+            parts.append(f"<assistant>\n{content}\n</assistant>")
+        else:  # user or other
+            parts.append(content)
+    return "\n\n".join(parts)
+
+
+class ClaudeCodeBackend:
+    """Backend using Claude Code via claude-agent-sdk.
+
+    This backend executes prompts through the Claude Code CLI, which provides
+    access to Claude with tool use capabilities. It's useful for local
+    development without API keys when Claude Code is installed.
+
+    Requires: pip install dbt-osmosis[claude-code]
+
+    Environment variables:
+        LLM_BACKEND: Set to 'claude-code' to use this backend
+    """
+
+    def __init__(self, max_turns: int = 1) -> None:
+        """Initialize the Claude Code backend.
+
+        Args:
+            max_turns: Maximum conversation turns (default 1 for single response).
+        """
+        self._max_turns = max_turns
+        self._available: bool | None = None
+
+    def is_available(self) -> bool:
+        """Check if Claude Code is available.
+
+        Returns:
+            True if claude-agent-sdk is installed and CLI is accessible.
+        """
+        if self._available is not None:
+            return self._available
+
+        try:
+            from claude_agent_sdk import (  # noqa: F401
+                AssistantMessage,
+                ClaudeAgentOptions,
+                CLIConnectionError,
+                CLINotFoundError,
+                ProcessError,
+                TextBlock,
+                query,
+            )
+
+            self._available = True
+        except ImportError:
+            self._available = False
+
+        return self._available
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,  # noqa: ARG002
+    ) -> LLMResponse:
+        """Generate a response using Claude Code CLI.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            temperature: Ignored for Claude Code (not configurable via CLI).
+
+        Returns:
+            LLMResponse with the generated content.
+
+        Raises:
+            LLMConfigurationError: If claude-agent-sdk is not installed.
+            LLMResponseError: If Claude Code returns an error or empty response.
+        """
+        if not self.is_available():
+            raise LLMConfigurationError(
+                "claude-agent-sdk is not installed. "
+                "Install it with: pip install dbt-osmosis[claude-code]"
+            )
+
+        # Imports are guaranteed to work after is_available() check
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            CLIConnectionError,
+            CLINotFoundError,
+            ProcessError,
+            TextBlock,
+            query,
+        )
+
+        prompt = _messages_to_prompt(messages)
+
+        # Extract system prompt if present
+        system_prompt = None
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = msg.get("content")
+                break
+
+        async def _run_query() -> str:
+            text_parts: list[str] = []
+            options = ClaudeAgentOptions(
+                system_prompt=system_prompt,
+                max_turns=self._max_turns,
+            )
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(block.text)
+            except CLINotFoundError as e:
+                raise LLMConfigurationError(
+                    "Claude Code CLI not found. "
+                    "Install it with: pip install claude-agent-sdk"
+                ) from e
+            except CLIConnectionError as e:
+                raise LLMResponseError(f"Failed to connect to Claude Code: {e}") from e
+            except ProcessError as e:
+                raise LLMResponseError(
+                    f"Claude Code process failed (exit code {e.exit_code}): {e}"
+                ) from e
+            return "".join(text_parts)
+
+        # Run async query synchronously
+        import anyio
+
+        try:
+            content = anyio.from_thread.run(_run_query)
+        except RuntimeError:
+            # No async context running, use anyio.run directly
+            content = anyio.run(_run_query)
+
+        if not content:
+            raise LLMResponseError("Claude Code returned an empty response")
+
+        return LLMResponse(
+            content=content,
+            raw_response=None,
+            model="claude-code",
+            provider="claude-code",
+        )
+
+    @property
+    def name(self) -> str:
+        """Return the backend name."""
+        return "claude-code"
+
+
 def _call_llm(
     messages: list[dict[str, str]],
     temperature: float = 0.7,
