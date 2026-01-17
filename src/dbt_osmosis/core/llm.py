@@ -16,6 +16,13 @@ from openai import OpenAI
 from dbt_osmosis.core.exceptions import LLMConfigurationError, LLMResponseError
 
 __all__ = [
+    # Backend classes
+    "LLMBackend",
+    "LLMResponse",
+    "ProviderConfig",
+    "APIBackend",
+    "ClaudeCodeBackend",
+    # Generation functions
     "analyze_column_semantics",
     "generate_column_doc",
     "generate_dbt_model_from_nl",
@@ -25,11 +32,12 @@ __all__ = [
     "generate_table_doc",
     "generate_staging_model_spec",
     "generate_staging_sql",
-    "ColumnTransformation",
-    "StagingModelSpec",
     "generate_style_aware_column_doc",
     "generate_style_aware_table_doc",
     "suggest_documentation_improvements",
+    # Data classes
+    "ColumnTransformation",
+    "StagingModelSpec",
     "DocumentationSuggestion",
 ]
 
@@ -350,13 +358,59 @@ class ClaudeCodeBackend:
         return "claude-code"
 
 
+def _get_backend() -> LLMBackend:
+    """Get the appropriate LLM backend based on environment configuration.
+
+    Environment variables:
+        LLM_BACKEND: Backend type to use. Options:
+            - 'api' (default): Use OpenAI-compatible API backend
+            - 'claude-code': Use Claude Code CLI via claude-agent-sdk
+
+    Returns:
+        An LLMBackend instance.
+
+    Raises:
+        LLMConfigurationError: If the specified backend is invalid or unavailable.
+    """
+    backend_type = os.getenv("LLM_BACKEND", "api").lower()
+
+    if backend_type == "claude-code":
+        backend = ClaudeCodeBackend()
+        if not backend.is_available():
+            raise LLMConfigurationError(
+                "Claude Code backend requested but claude-agent-sdk is not installed. "
+                "Install it with: pip install dbt-osmosis[claude-code]"
+            )
+        return backend
+    elif backend_type == "api":
+        return APIBackend()
+    else:
+        raise LLMConfigurationError(
+            f"Invalid LLM_BACKEND '{backend_type}'. Valid options: api, claude-code"
+        )
+
+
 def _call_llm(
     messages: list[dict[str, str]],
     temperature: float = 0.7,
     backend: LLMBackend | None = None,
 ) -> str:
+    """Call the LLM backend to generate a response.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'.
+        temperature: LLM temperature for response generation.
+        backend: Optional backend override. If None, uses LLM_BACKEND env var.
+
+    Returns:
+        The generated response content as a string.
+
+    Raises:
+        LLMResponseError: If the LLM returns an empty response.
+        LLMConfigurationError: If the backend is misconfigured.
+    """
     if backend is None:
-        backend = APIBackend()
+        backend = _get_backend()
 
     response = backend.generate(messages, temperature)
 
